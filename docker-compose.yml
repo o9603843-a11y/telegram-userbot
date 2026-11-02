@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  userbot:
+    build: .
+    container_name: telegram_userbot
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./userbot.db:/app/userbot.db
