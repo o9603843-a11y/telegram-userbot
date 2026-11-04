@@ -51,6 +51,13 @@ def get_user_last_reply_time(user_id: int) -> float:
         return float(res[0]) if (res and res[0] is not None) else 0.0
 
 
+def has_user_been_replied(user_id: int) -> bool:
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM replied_users WHERE user_id = ? LIMIT 1", (user_id,))
+        return cursor.fetchone() is not None
+
+
 def record_reply_ts(user_id: int, first_name: str = "", username: str = "", timestamp: float = None):
     if timestamp is None:
         timestamp = time.time()

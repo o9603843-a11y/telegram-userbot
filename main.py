@@ -1,3 +1,4 @@
+import asyncio
 import html
 import logging
 import os
@@ -35,6 +36,21 @@ client = TelegramClient(session, config.API_ID, config.API_HASH)
 my_user_id = None
 last_owner_online_time = float(database.get_setting("last_owner_online_time", "0"))
 
+# Bot o'zi yuborgan xabarlarni eslab qolish (eganiki bilan adashtirmaslik uchun)
+_bot_sent_msg_ids = set()
+_is_sending_bot_msg = False
+_user_locks = {}
+
+
+def get_user_lock(user_id: int) -> asyncio.Lock:
+    """
+    Bitta foydalanuvchidan tez-tez yoki ketma-ket xabarlar kelganda
+    poyga holati (race condition) yuz bermasligi uchun har bir userga alohida lock
+    """
+    if user_id not in _user_locks:
+        _user_locks[user_id] = asyncio.Lock()
+    return _user_locks[user_id]
+
 
 def update_owner_online_time(ts: float = None):
     """
@@ -52,6 +68,7 @@ async def is_owner_online() -> bool:
     """
     Ega hozir online ekanligini va oxirgi online vaqtini aniqlash
     """
+    global last_owner_online_time
     try:
         me = await client.get_entity('me')
         status = getattr(me, 'status', None)
@@ -127,7 +144,14 @@ async def handle_user_update(event):
     Eganing online holati o'zgarganda (hatto 1 sekundga kirib chiqsa ham) eslab qolish
     """
     global my_user_id
-    if my_user_id and event.user_id == my_user_id:
+    if my_user_id is None:
+        try:
+            me = await client.get_me()
+            my_user_id = me.id
+        except Exception:
+            return
+
+    if event.user_id == my_user_id:
         if event.online:
             logger.info("🟢 Siz Telegramda online bo'ldingiz.")
             update_owner_online_time(time.time())
@@ -142,12 +166,31 @@ async def handle_outgoing_message(event):
     """
     Ega xabar yozsa (harakat qilsa) uni online deb belgilash va buyruqlarni bajarish
     """
-    global my_user_id
-    update_owner_online_time(time.time())
+    global my_user_id, _is_sending_bot_msg, _bot_sent_msg_ids
+
+    # 1. Agar botning o'zi yuborayotgan xabar bo'lsa, e'tiborsiz qoldiramiz
+    if _is_sending_bot_msg:
+        return
+
+    # 2. Agar bu xabar bot yuborgan xabarlar ro'yxatida bo'lsa
+    if event.id in _bot_sent_msg_ids:
+        return
 
     text = event.raw_text or ""
-    prefix = config.CMD_PREFIX
 
+    # 3. Agar botning avtojavob matni bilan bir xil bo'lsa
+    current_reply_text = database.get_setting("auto_reply_text", config.DEFAULT_AUTO_REPLY)
+    if text.strip() == current_reply_text.strip():
+        return
+
+    # 4. Agar botning Saved Messages ga yuborgan bildirishnomasi bo'lsa
+    if "Yangi xabar keldi va avtojavob berildi!" in text:
+        return
+
+    # Ega (inson) harakat qildi -> online vaqtini yangilaymiz!
+    update_owner_online_time(time.time())
+
+    prefix = config.CMD_PREFIX
     if not text.startswith(prefix):
         return
 
@@ -161,6 +204,7 @@ async def handle_outgoing_message(event):
             f"🤖 **UserBot Boshqaruv Paneli:**\n\n"
             f"▫️ `{prefix}status` — Bot holati va oxirgi online vaqti\n"
             f"▫️ `{prefix}toggle` — Avtojavobni yoqish / o'chirish\n"
+            f"▫️ `{prefix}replyonce` — Javob rejimini almashtirish (Faqat 1 marta / Har sessiyada 1 marta)\n"
             f"▫️ `{prefix}gettext` — Hozirgi avtojavob matnini ko'rish\n"
             f"▫️ `{prefix}settext <matn>` — Yangi avtojavob matnini o'rnatish\n"
             f"▫️ `{prefix}notify` — Bildirishnomalarni yoqish/o'chirish\n"
@@ -180,6 +224,8 @@ async def handle_outgoing_message(event):
         online_now = await is_owner_online()
 
         last_online_str = datetime.fromtimestamp(last_owner_online_time).strftime("%Y-%m-%d %H:%M:%S") if last_owner_online_time > 0 else "Hali qayd etilmagan"
+        reply_once_state = database.get_setting("reply_once", "1" if config.REPLY_ONCE else "0") == "1"
+        rule_desc = "Faqat 1 marta (Umuman bitta odamga 1 marta)" if reply_once_state else "Har bir offline sessiyasida 1 marta"
 
         status_msg = (
             f"📊 **UserBot Holati:**\n\n"
@@ -187,7 +233,7 @@ async def handle_outgoing_message(event):
             f"• **Sizning holatingiz:** {'🟢 Online' if online_now else '🔴 Offline'}\n"
             f"• **Oxirgi online vaqti:** `{last_online_str}`\n"
             f"• **Javob olgan foydalanuvchilar:** `{count} ta`\n"
-            f"• **Avtojavob qoidasi:** Faqat offline bo'lganda (har bir offline sessiyasida 1 marta)\n"
+            f"• **Avtojavob qoidasi:** {rule_desc}\n"
             f"• **Bildirishnoma yuborish:** {'✅ ' + notify_channel if notify_me else '❌ O\'chirilgan'}\n\n"
             f"📝 **Hozirgi avtojavob matni:**\n_{current_text}_"
         )
@@ -200,6 +246,14 @@ async def handle_outgoing_message(event):
         database.set_setting("is_active", new_state)
         state_str = "🟢 **Yoqildi**" if new_state == "1" else "🔴 **O'chirildi**"
         await event.edit(f"Avtojavob holati: {state_str}")
+
+    # .replyonce
+    elif cmd == "replyonce":
+        reply_once_state = database.get_setting("reply_once", "1" if config.REPLY_ONCE else "0") == "1"
+        new_state = "0" if reply_once_state else "1"
+        database.set_setting("reply_once", new_state)
+        mode_str = "🟢 **Faqat 1 marta (Umuman bitta odamga 1 marta)**" if new_state == "1" else "🔄 **Har bir offline sessiyasida 1 marta**"
+        await event.edit(f"Avtojavob rejimi o'zgartirildi:\n{mode_str}")
 
     # .notify (toggle notification)
     elif cmd == "notify":
@@ -282,64 +336,91 @@ async def handle_incoming_private(event):
     if not is_active:
         return
 
-    # 1. Ega hozir online-mi?
-    owner_online = await is_owner_online()
-    if owner_online:
-        logger.info(f"Siz hozir ONLINESIZ. {getattr(sender, 'first_name', '')} xabariga avtojavob berilmadi.")
-        return
-
-    # 2. Ushbu foydalanuvchiga oxirgi javob berilgan vaqt
-    user_last_reply = database.get_user_last_reply_time(sender_id)
-
-    # Agar oxirgi online bo'lganingizdan keyin ushbu foydalanuvchiga allaqachon javob berilgan bo'lsa:
-    if user_last_reply > 0 and user_last_reply >= last_owner_online_time:
-        logger.info(f"Ushbu offline sessiyada {getattr(sender, 'first_name', '')} ga allaqachon javob berilgan.")
-        return
-
-    # Avtojavob matnini olish
-    reply_text = database.get_setting("auto_reply_text", config.DEFAULT_AUTO_REPLY)
     sender_name = getattr(sender, "first_name", "") or "Foydalanuvchi"
     username = getattr(sender, "username", "") or ""
 
-    try:
-        # Xabarga javob qaytarish
-        await event.reply(reply_text)
+    # Ketma-ket kelgan xabarlarda poyga holati (race condition) yuz bermasligi uchun lock
+    async with get_user_lock(sender_id):
+        # 1. Ega hozir online-mi?
+        owner_online = await is_owner_online()
+        if owner_online:
+            logger.info(f"Siz hozir ONLINESIZ. {sender_name} xabariga avtojavob berilmadi.")
+            return
 
-        # Bazaga vaqt tamg'asi bilan yozish
-        current_ts = time.time()
-        database.record_reply_ts(sender_id, sender_name, username, current_ts)
-        logger.info(f"✅ Avtojavob muvaffaqiyatli yuborildi: {sender_name} (@{username} | ID: {sender_id})")
+        # 2. Ushbu foydalanuvchiga oxirgi javob berilgan vaqt
+        user_last_reply = database.get_user_last_reply_time(sender_id)
 
-        # Egasi (o'zingiz) ga bildirishnoma jo'natish
-        notify_me = database.get_setting("notify_me", "1" if config.NOTIFY_ME else "0") == "1"
-        if notify_me:
-            user_msg = event.raw_text or "[Ovozli/Rasm/Media xabar]"
+        # 3. Sozlamadan faqat 1 marta javob berish rejimini tekshiramiz
+        reply_once = database.get_setting("reply_once", "1" if config.REPLY_ONCE else "0") == "1"
 
-            # Telegram bot orqali jo'natamiz
-            sent_via_bot = False
-            if config.BOT_TOKEN and my_user_id:
-                sent_via_bot = await send_bot_notification(
-                    chat_id=my_user_id,
-                    sender_name=sender_name,
-                    username=username,
-                    sender_id=sender_id,
-                    message_text=user_msg
-                )
+        if reply_once:
+            # Agar 'faqat 1 marta' rejimi yoqilgan bo'lsa va bu odamga avval javob berilgan bo'lsa
+            if user_last_reply > 0:
+                logger.info(f"{sender_name} ga allaqachon javob berilgan (faqat 1 marta qoidasi).")
+                return
+        else:
+            # Agar oxirgi online bo'lganingizdan keyin ushbu foydalanuvchiga allaqachon javob berilgan bo'lsa
+            if user_last_reply > 0 and user_last_reply >= last_owner_online_time:
+                logger.info(f"Ushbu offline sessiyada {sender_name} ga allaqachon javob berilgan.")
+                return
 
-            # Agar bot orqali yetib bormasa, "Saved Messages" ga yuboramiz
-            if not sent_via_bot:
-                user_link = f"@{username}" if username else f"ID: {sender_id}"
-                now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                notify_text = (
-                    f"📩 **Yangi xabar keldi va avtojavob berildi!**\n\n"
-                    f"👤 **Kimdan:** {sender_name} ({user_link})\n"
-                    f"💬 **Xabari:**\n_{user_msg}_\n\n"
-                    f"🕒 **Vaqti:** `{now_str}`"
-                )
-                await client.send_message("me", notify_text)
+        # Avtojavob matnini olish
+        reply_text = database.get_setting("auto_reply_text", config.DEFAULT_AUTO_REPLY)
 
-    except Exception as e:
-        logger.error(f"Xatolik yuz berdi (avtojavob): {e}")
+        try:
+            # Xabarga javob qaytarish
+            global _is_sending_bot_msg, _bot_sent_msg_ids
+            _is_sending_bot_msg = True
+            try:
+                sent_msg = await event.reply(reply_text)
+                if sent_msg and hasattr(sent_msg, "id"):
+                    _bot_sent_msg_ids.add(sent_msg.id)
+                    if len(_bot_sent_msg_ids) > 1000:
+                        _bot_sent_msg_ids.clear()
+            finally:
+                _is_sending_bot_msg = False
+
+            # Bazaga vaqt tamg'asi bilan yozish
+            current_ts = time.time()
+            database.record_reply_ts(sender_id, sender_name, username, current_ts)
+            logger.info(f"✅ Avtojavob muvaffaqiyatli yuborildi: {sender_name} (@{username} | ID: {sender_id})")
+
+            # Egasi (o'zingiz) ga bildirishnoma jo'natish
+            notify_me = database.get_setting("notify_me", "1" if config.NOTIFY_ME else "0") == "1"
+            if notify_me:
+                user_msg = event.raw_text or "[Ovozli/Rasm/Media xabar]"
+
+                # Telegram bot orqali jo'natamiz
+                sent_via_bot = False
+                if config.BOT_TOKEN and my_user_id:
+                    sent_via_bot = await send_bot_notification(
+                        chat_id=my_user_id,
+                        sender_name=sender_name,
+                        username=username,
+                        sender_id=sender_id,
+                        message_text=user_msg
+                    )
+
+                # Agar bot orqali yetib bormasa, "Saved Messages" ga yuboramiz
+                if not sent_via_bot:
+                    user_link = f"@{username}" if username else f"ID: {sender_id}"
+                    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    notify_text = (
+                        f"📩 **Yangi xabar keldi va avtojavob berildi!**\n\n"
+                        f"👤 **Kimdan:** {sender_name} ({user_link})\n"
+                        f"💬 **Xabari:**\n_{user_msg}_\n\n"
+                        f"🕒 **Vaqti:** `{now_str}`"
+                    )
+                    _is_sending_bot_msg = True
+                    try:
+                        sent_notify = await client.send_message("me", notify_text)
+                        if sent_notify and hasattr(sent_notify, "id"):
+                            _bot_sent_msg_ids.add(sent_notify.id)
+                    finally:
+                        _is_sending_bot_msg = False
+
+        except Exception as e:
+            logger.error(f"Xatolik yuz berdi (avtojavob): {e}")
 
 
 async def health_check_handler(request):
